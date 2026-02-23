@@ -13,23 +13,24 @@ import (
 )
 
 type pickResult struct {
-	Success                     bool
-	IsHolding                   bool
-	DetectedPositionCameraFrame r3.Vector
-	ObjectPositionWorldFrame    r3.Vector
-	GripperPositionWorldFrame   r3.Vector
-	ApproachOffsetMm            r3.Vector
-	WorldFrameOffsetMm          r3.Vector
-	StepsCompleted              []string
+	Success                   bool
+	IsHolding                 bool
+	DetectedPosition          r3.Vector
+	DetectionFrame            string
+	ObjectPositionWorldFrame  r3.Vector
+	GripperPositionWorldFrame r3.Vector
+	ApproachOffsetMm          r3.Vector
+	WorldFrameOffsetMm        r3.Vector
+	StepsCompleted            []string
 }
 
-func (r *pickResult) toMap(cameraName string) map[string]interface{} {
+func (r *pickResult) toMap() map[string]interface{} {
 	return map[string]interface{}{
 		"success":    r.Success,
 		"is_holding": r.IsHolding,
-		"detected_position_camera_frame": map[string]interface{}{
-			"x_mm": r.DetectedPositionCameraFrame.X, "y_mm": r.DetectedPositionCameraFrame.Y,
-			"z_mm": r.DetectedPositionCameraFrame.Z, "frame": cameraName,
+		"detected_position": map[string]interface{}{
+			"x_mm": r.DetectedPosition.X, "y_mm": r.DetectedPosition.Y,
+			"z_mm": r.DetectedPosition.Z, "frame": r.DetectionFrame,
 		},
 		"object_position_world_frame": map[string]interface{}{
 			"x_mm": r.ObjectPositionWorldFrame.X, "y_mm": r.ObjectPositionWorldFrame.Y,
@@ -60,13 +61,19 @@ func (s *handEyeTest) executePick(ctx context.Context, obj DetectedObject) (map[
 	s.currentStatus = "picking"
 	s.mu.Unlock()
 
-	result := &pickResult{
-		DetectedPositionCameraFrame: obj.Center,
+	detectionFrame := s.cfg.DetectionFrame
+	if detectionFrame == "" {
+		detectionFrame = s.cfg.Camera
 	}
-	cameraName := s.cfg.Camera
+	isWorldFrame := detectionFrame == "world"
 
-	s.logger.Infof("Starting pick sequence for object at camera-frame position: (%.1f, %.1f, %.1f)mm",
-		obj.Center.X, obj.Center.Y, obj.Center.Z)
+	result := &pickResult{
+		DetectedPosition: obj.Center,
+		DetectionFrame:   detectionFrame,
+	}
+
+	s.logger.Infof("Starting pick sequence for object at %s-frame position: (%.1f, %.1f, %.1f)mm",
+		detectionFrame, obj.Center.X, obj.Center.Y, obj.Center.Z)
 
 	// Step 1: Open gripper
 	s.logger.Infof("Opening gripper...")
@@ -75,23 +82,43 @@ func (s *handEyeTest) executePick(ctx context.Context, obj DetectedObject) (map[
 	}
 	result.StepsCompleted = append(result.StepsCompleted, "open_gripper")
 
-	// Step 2: Get world-frame reference for the object position
-	// Use motion.GetPose to get gripper's world-frame position, and then we'll compare after moving.
-	gripperWorldPoseBefore, err := s.motion.GetPose(ctx, s.cfg.Gripper, "world", nil, nil)
-	if err != nil {
-		s.logger.Warnf("Could not get gripper world pose (non-fatal): %v", err)
+	// Step 2: Compute approach pose in detection frame
+	var approachPoint r3.Vector
+	if isWorldFrame {
+		// World frame: Z is up, approach is above the object
+		approachPoint = r3.Vector{
+			X: obj.Center.X,
+			Y: obj.Center.Y,
+			Z: obj.Center.Z + s.cfg.ApproachOffsetMm,
+		}
+	} else {
+		// Camera frame: Z is depth (away from camera), approach is closer to camera
+		approachPoint = r3.Vector{
+			X: obj.Center.X,
+			Y: obj.Center.Y,
+			Z: obj.Center.Z - s.cfg.ApproachOffsetMm,
+		}
 	}
-	_ = gripperWorldPoseBefore // for reference
 
-	// Step 3: Compute approach pose in camera frame (offset above the object)
-	approachPose := spatialmath.NewPose(
-		r3.Vector{X: obj.Center.X, Y: obj.Center.Y, Z: obj.Center.Z - s.cfg.ApproachOffsetMm},
-		&spatialmath.OrientationVectorDegrees{OZ: 1, Theta: 0},
-	)
-	approachDest := referenceframe.NewPoseInFrame(cameraName, approachPose)
+	// Get current gripper orientation in the detection frame for the approach destination.
+	var approachOrientation spatialmath.Orientation
+	if isWorldFrame {
+		gripperPose, err := s.motion.GetPose(ctx, s.cfg.Gripper, "world", nil, nil)
+		if err != nil {
+			s.logger.Warnf("Could not get gripper world pose for orientation, using default: %v", err)
+			approachOrientation = &spatialmath.OrientationVectorDegrees{OX: 0, OY: 1, OZ: 0, Theta: 180}
+		} else {
+			approachOrientation = gripperPose.Pose().Orientation()
+		}
+	} else {
+		approachOrientation = &spatialmath.OrientationVectorDegrees{OZ: 1, Theta: 0}
+	}
 
-	// Step 4: Move to approach position
-	s.logger.Infof("Moving to approach position (%.0fmm above object)...", s.cfg.ApproachOffsetMm)
+	approachPose := spatialmath.NewPose(approachPoint, approachOrientation)
+	approachDest := referenceframe.NewPoseInFrame(detectionFrame, approachPose)
+
+	// Step 3: Move to approach position using motion planning (obstacle-aware)
+	s.logger.Infof("Moving to approach position (%.0fmm above object) via motion planning...", s.cfg.ApproachOffsetMm)
 	success, err := s.motion.Move(ctx, motion.MoveReq{
 		ComponentName: s.cfg.Gripper,
 		Destination:   approachDest,
@@ -104,7 +131,7 @@ func (s *handEyeTest) executePick(ctx context.Context, obj DetectedObject) (map[
 	}
 	result.StepsCompleted = append(result.StepsCompleted, "approach")
 
-	// Step 5: Re-detect object from approach position for offset measurement
+	// Step 4: Re-detect from approach position for offset measurement
 	s.logger.Infof("Re-detecting object from approach position...")
 	redetectedObjects, err := detectObjects(ctx, s.camera, s.cfg)
 	if err != nil {
@@ -122,48 +149,50 @@ func (s *handEyeTest) executePick(ctx context.Context, obj DetectedObject) (map[
 	}
 	result.StepsCompleted = append(result.StepsCompleted, "re_detect")
 
-	// Step 6: Move to grasp position
-	graspPose := spatialmath.NewPose(
-		r3.Vector{
-			X: obj.Center.X,
-			Y: obj.Center.Y,
-			Z: obj.Center.Z + s.cfg.GraspDepthOffsetMm,
-		},
-		&spatialmath.OrientationVectorDegrees{OZ: 1, Theta: 0},
-	)
-	graspDest := referenceframe.NewPoseInFrame(cameraName, graspPose)
-
-	s.logger.Infof("Moving to grasp position...")
-	success, err = s.motion.Move(ctx, motion.MoveReq{
-		ComponentName: s.cfg.Gripper,
-		Destination:   graspDest,
-	})
+	// Step 5: Move to grasp position using direct Cartesian move via arm driver.
+	// This is a short straight-line move down from the approach position — no motion planning needed.
+	currentPose, err := s.arm.EndPosition(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to move to grasp position: %w", err)
+		return nil, fmt.Errorf("failed to get arm position: %w", err)
 	}
-	if !success {
-		return nil, fmt.Errorf("motion planner could not find path to grasp position")
+	graspDelta := s.cfg.ApproachOffsetMm - s.cfg.GraspDepthOffsetMm
+	graspPoint := r3.Vector{
+		X: currentPose.Point().X,
+		Y: currentPose.Point().Y,
+		Z: currentPose.Point().Z - graspDelta,
+	}
+	graspPose := spatialmath.NewPose(graspPoint, currentPose.Orientation())
+
+	s.logger.Infof("Moving to grasp position (%.0fmm below approach, direct Cartesian move)...", graspDelta)
+	if err := s.arm.MoveToPosition(ctx, graspPose, nil); err != nil {
+		return nil, fmt.Errorf("failed to move to grasp position: %w", err)
 	}
 	result.StepsCompleted = append(result.StepsCompleted, "grasp_position")
 
-	// Step 7: World-frame comparison
+	// Step 6: World-frame comparison
 	gripperWorldPose, err := s.motion.GetPose(ctx, s.cfg.Gripper, "world", nil, nil)
 	if err != nil {
-		s.logger.Warnf("Could not get gripper world pose after grasp move (non-fatal): %v", err)
+		s.logger.Warnf("Could not get gripper world pose (non-fatal): %v", err)
 	} else {
 		gripperPos := gripperWorldPose.Pose().Point()
 		result.GripperPositionWorldFrame = gripperPos
 
-		// Also get the object's world-frame position for comparison
-		objectWorldPose, err := s.motion.GetPose(ctx, s.cfg.Camera, "world", nil, nil)
-		if err != nil {
-			s.logger.Warnf("Could not get camera world pose (non-fatal): %v", err)
+		if isWorldFrame {
+			// Detection was in world frame — object position is already in world frame
+			result.ObjectPositionWorldFrame = obj.Center
 		} else {
-			// The object is at obj.Center in camera frame. Transform to world using camera's world pose.
-			cameraPose := objectWorldPose.Pose()
-			objectInWorld := spatialmath.Compose(cameraPose, spatialmath.NewPoseFromPoint(obj.Center))
-			result.ObjectPositionWorldFrame = objectInWorld.Point()
+			// Detection was in camera frame — transform to world
+			cameraWorldPose, err := s.motion.GetPose(ctx, s.cfg.Camera, "world", nil, nil)
+			if err != nil {
+				s.logger.Warnf("Could not get camera world pose (non-fatal): %v", err)
+			} else {
+				cameraPose := cameraWorldPose.Pose()
+				objectInWorld := spatialmath.Compose(cameraPose, spatialmath.NewPoseFromPoint(obj.Center))
+				result.ObjectPositionWorldFrame = objectInWorld.Point()
+			}
+		}
 
+		if result.ObjectPositionWorldFrame != (r3.Vector{}) {
 			result.WorldFrameOffsetMm = r3.Vector{
 				X: gripperPos.X - result.ObjectPositionWorldFrame.X,
 				Y: gripperPos.Y - result.ObjectPositionWorldFrame.Y,
@@ -175,7 +204,7 @@ func (s *handEyeTest) executePick(ctx context.Context, obj DetectedObject) (map[
 		}
 	}
 
-	// Step 8: Grab
+	// Step 7: Grab
 	s.logger.Infof("Closing gripper...")
 	grabbed, err := s.gripper.Grab(ctx, nil)
 	if err != nil {
@@ -184,27 +213,25 @@ func (s *handEyeTest) executePick(ctx context.Context, obj DetectedObject) (map[
 	s.logger.Infof("Grab reported: %v", grabbed)
 	result.StepsCompleted = append(result.StepsCompleted, "grab")
 
-	// Step 9: Lift
-	s.logger.Infof("Lifting %.0fmm...", s.cfg.LiftHeightMm)
-	liftPose := spatialmath.NewPose(
-		r3.Vector{
-			X: obj.Center.X,
-			Y: obj.Center.Y,
-			Z: obj.Center.Z + s.cfg.GraspDepthOffsetMm - s.cfg.LiftHeightMm,
-		},
-		&spatialmath.OrientationVectorDegrees{OZ: 1, Theta: 0},
-	)
-	liftDest := referenceframe.NewPoseInFrame(cameraName, liftPose)
-	_, err = s.motion.Move(ctx, motion.MoveReq{
-		ComponentName: s.cfg.Gripper,
-		Destination:   liftDest,
-	})
+	// Step 8: Lift using direct Cartesian move — short straight-line move up
+	s.logger.Infof("Lifting %.0fmm (direct Cartesian move)...", s.cfg.LiftHeightMm)
+	currentPose, err = s.arm.EndPosition(ctx, nil)
 	if err != nil {
-		s.logger.Warnf("Lift move failed (non-fatal): %v", err)
+		s.logger.Warnf("Failed to get arm position for lift (non-fatal): %v", err)
+	} else {
+		liftPoint := r3.Vector{
+			X: currentPose.Point().X,
+			Y: currentPose.Point().Y,
+			Z: currentPose.Point().Z + s.cfg.LiftHeightMm,
+		}
+		liftPose := spatialmath.NewPose(liftPoint, currentPose.Orientation())
+		if err := s.arm.MoveToPosition(ctx, liftPose, nil); err != nil {
+			s.logger.Warnf("Lift move failed (non-fatal): %v", err)
+		}
 	}
 	result.StepsCompleted = append(result.StepsCompleted, "lift")
 
-	// Step 10: Verify
+	// Step 9: Verify
 	s.logger.Infof("Verifying hold...")
 	holdingStatus, err := s.gripper.IsHoldingSomething(ctx, nil)
 	if err != nil {
@@ -221,5 +248,5 @@ func (s *handEyeTest) executePick(ctx context.Context, obj DetectedObject) (map[
 		s.logger.Infof("RESULT: FAIL - gripper did not hold object")
 	}
 
-	return result.toMap(cameraName), nil
+	return result.toMap(), nil
 }

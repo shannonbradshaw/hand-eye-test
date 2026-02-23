@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/golang/geo/r3"
+
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/components/gripper"
@@ -105,6 +107,15 @@ func (s *handEyeTest) DoCommand(ctx context.Context, cmd map[string]interface{})
 			objectIndex = int(idx)
 		}
 		return s.handlePickDetected(ctx, objectIndex)
+	case "move_to":
+		x, _ := cmd["x"].(float64)
+		y, _ := cmd["y"].(float64)
+		z, _ := cmd["z"].(float64)
+		stepSize := 20.0
+		if ss, ok := cmd["step_size"].(float64); ok && ss > 0 {
+			stepSize = ss
+		}
+		return s.handleMoveTo(ctx, r3.Vector{X: x, Y: y, Z: z}, stepSize)
 	case "status":
 		return s.handleStatus()
 	default:

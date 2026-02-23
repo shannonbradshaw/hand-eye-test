@@ -26,6 +26,8 @@ type SegmentationConfig struct {
 	MinPtsInSegment    int       `json:"min_pts_in_segment"`
 	ClusteringRadiusMm float64   `json:"clustering_radius_mm"`
 	MeanKFiltering     int       `json:"mean_k_filtering"`
+	MaxDepthMm         float64   `json:"max_depth_mm"`
+	MaxPointCount      int       `json:"max_point_count"`
 }
 
 func (sc *SegmentationConfig) groundNormalVec() r3.Vector {
@@ -39,6 +41,7 @@ type Config struct {
 	Arm                string             `json:"arm"`
 	Camera             string             `json:"camera"`
 	Gripper            string             `json:"gripper"`
+	DetectionFrame     string             `json:"detection_frame"`
 	ApproachOffsetMm   float64            `json:"approach_offset_mm"`
 	GraspDepthOffsetMm float64            `json:"grasp_depth_offset_mm"`
 	LiftHeightMm       float64            `json:"lift_height_mm"`

@@ -46,6 +46,12 @@ func detectObjects(ctx context.Context, cam camera.Camera, cfg *Config) ([]Detec
 	var detected []DetectedObject
 	for _, obj := range objects {
 		center := computeCenter(obj)
+		if cfg.Segmentation.MaxDepthMm > 0 && center.Z > cfg.Segmentation.MaxDepthMm {
+			continue
+		}
+		if cfg.Segmentation.MaxPointCount > 0 && obj.Size() > cfg.Segmentation.MaxPointCount {
+			continue
+		}
 		detected = append(detected, DetectedObject{
 			Center:     center,
 			PointCount: obj.Size(),
